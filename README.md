@@ -2,6 +2,12 @@
 
 Projeto da disciplina de Sistemas Distribuídos.
 
+Integrantes:
+
+Gabriel Koiama
+
+João Pedro Lopes
+
 ## O que esta entrega implementa
 
 Esta primeira entrega cobre:
