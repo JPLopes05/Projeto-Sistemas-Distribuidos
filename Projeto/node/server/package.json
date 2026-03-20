@@ -1,0 +1,11 @@
+{
+  "name": "sd-node-server",
+  "version": "1.0.0",
+  "description": "Servidor Node.js para a Parte 1 de Sistemas Distribuídos",
+  "main": "server.js",
+  "license": "MIT",
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
+    "zeromq": "^6.4.0"
+  }
+}

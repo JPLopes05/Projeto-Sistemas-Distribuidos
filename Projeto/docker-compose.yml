@@ -1,0 +1,124 @@
+services:
+  broker:
+    build: ./broker
+    container_name: broker
+    environment:
+      FRONTEND_BIND: tcp://*:5555
+      BACKEND_BIND: tcp://*:5556
+      EXPECTED_SERVERS: "4"
+      SERVER_RPC_TIMEOUT_MS: "8000"
+    ports:
+      - "5555:5555"
+      - "5556:5556"
+
+  py_server_1:
+    build: ./python/server
+    container_name: py_server_1
+    depends_on:
+      - broker
+    environment:
+      SERVER_ID: py_server_1
+      BACKEND_ENDPOINT: tcp://broker:5556
+      DATA_FILE: /data/state.json
+    volumes:
+      - ./data/py_server_1:/data
+
+  py_server_2:
+    build: ./python/server
+    container_name: py_server_2
+    depends_on:
+      - broker
+    environment:
+      SERVER_ID: py_server_2
+      BACKEND_ENDPOINT: tcp://broker:5556
+      DATA_FILE: /data/state.json
+    volumes:
+      - ./data/py_server_2:/data
+
+  js_server_1:
+    build: ./node/server
+    container_name: js_server_1
+    depends_on:
+      - broker
+    environment:
+      SERVER_ID: js_server_1
+      BACKEND_ENDPOINT: tcp://broker:5556
+      DATA_FILE: /data/state.json
+    volumes:
+      - ./data/js_server_1:/data
+
+  js_server_2:
+    build: ./node/server
+    container_name: js_server_2
+    depends_on:
+      - broker
+    environment:
+      SERVER_ID: js_server_2
+      BACKEND_ENDPOINT: tcp://broker:5556
+      DATA_FILE: /data/state.json
+    volumes:
+      - ./data/js_server_2:/data
+
+  py_client_1:
+    build: ./python/client
+    container_name: py_client_1
+    depends_on:
+      - broker
+      - py_server_1
+      - py_server_2
+      - js_server_1
+      - js_server_2
+    environment:
+      CLIENT_NAME: py_client_1
+      USERNAME: alice_py
+      TARGET_CHANNEL: backend
+      BROKER_ENDPOINT: tcp://broker:5555
+      STARTUP_DELAY_SECONDS: "8"
+
+  py_client_2:
+    build: ./python/client
+    container_name: py_client_2
+    depends_on:
+      - broker
+      - py_server_1
+      - py_server_2
+      - js_server_1
+      - js_server_2
+    environment:
+      CLIENT_NAME: py_client_2
+      USERNAME: bob_py
+      TARGET_CHANNEL: frontend
+      BROKER_ENDPOINT: tcp://broker:5555
+      STARTUP_DELAY_SECONDS: "10"
+
+  js_client_1:
+    build: ./node/client
+    container_name: js_client_1
+    depends_on:
+      - broker
+      - py_server_1
+      - py_server_2
+      - js_server_1
+      - js_server_2
+    environment:
+      CLIENT_NAME: js_client_1
+      USERNAME: carol_js
+      TARGET_CHANNEL: devops
+      BROKER_ENDPOINT: tcp://broker:5555
+      STARTUP_DELAY_SECONDS: "12"
+
+  js_client_2:
+    build: ./node/client
+    container_name: js_client_2
+    depends_on:
+      - broker
+      - py_server_1
+      - py_server_2
+      - js_server_1
+      - js_server_2
+    environment:
+      CLIENT_NAME: js_client_2
+      USERNAME: dave_js
+      TARGET_CHANNEL: geral
+      BROKER_ENDPOINT: tcp://broker:5555
+      STARTUP_DELAY_SECONDS: "14"
