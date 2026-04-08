@@ -11,6 +11,7 @@ import zmq
 
 SERVER_ID = os.getenv("SERVER_ID", "py_server_1")
 BACKEND_ENDPOINT = os.getenv("BACKEND_ENDPOINT", "tcp://broker:5556")
+PUBSUB_PROXY_IN_ENDPOINT = os.getenv("PUBSUB_PROXY_IN_ENDPOINT", "tcp://pubsub_proxy:5557")
 DATA_FILE = os.getenv("DATA_FILE", "/data/state.json")
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{3,20}$")
@@ -40,15 +41,27 @@ def ensure_parent(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
+def default_state() -> Dict[str, Any]:
+    return {
+        "server_id": SERVER_ID,
+        "users": [],
+        "logins": [],
+        "channels": ["geral"],
+        "requests": [],
+        "publications": [],
+    }
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    ensure_parent(DATA_FILE)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
 def load_state() -> Dict[str, Any]:
     ensure_parent(DATA_FILE)
     if not os.path.exists(DATA_FILE):
-        state = {
-            "server_id": SERVER_ID,
-            "users": [],
-            "logins": [],
-            "channels": ["geral"],
-        }
+        state = default_state()
         save_state(state)
         return state
 
@@ -59,15 +72,37 @@ def load_state() -> Dict[str, Any]:
     state.setdefault("users", [])
     state.setdefault("logins", [])
     state.setdefault("channels", ["geral"])
+    state.setdefault("requests", [])
+    state.setdefault("publications", [])
     if "geral" not in state["channels"]:
         state["channels"].append("geral")
     return state
 
 
-def save_state(state: Dict[str, Any]) -> None:
-    ensure_parent(DATA_FILE)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+def persist_request(state: Dict[str, Any], request: dict, processed_at: str) -> None:
+    state["requests"].append(
+        {
+            "request_id": request.get("request_id"),
+            "request_type": request.get("type"),
+            "username": request.get("username"),
+            "channel": request.get("channel"),
+            "message": request.get("message"),
+            "origin": request.get("origin"),
+            "client_timestamp": request.get("timestamp"),
+            "server_processed_at": processed_at,
+        }
+    )
+
+
+def publication_exists(state: Dict[str, Any], publication_id: str) -> bool:
+    return any(pub.get("publication_id") == publication_id for pub in state["publications"])
+
+
+def persist_publication(state: Dict[str, Any], publication: dict) -> None:
+    publication_id = publication.get("publication_id")
+    if publication_id and publication_exists(state, publication_id):
+        return
+    state["publications"].append(publication)
 
 
 def ok_response(request: dict, **extra) -> dict:
@@ -104,16 +139,19 @@ def handle_login(request: dict) -> dict:
         )
 
     state = load_state()
+    processed_at = now_iso()
+    persist_request(state, request, processed_at)
+
     if username in state["users"]:
+        save_state(state)
         return error_response(request, f"Usuário '{username}' já existe.")
 
-    state["users"].append(username)
-    state["users"] = sorted(set(state["users"]))
+    state["users"] = sorted(set([*state["users"], username]))
     state["logins"].append(
         {
             "username": username,
-            "timestamp": request.get("timestamp", now_iso()),
-            "server_processed_at": now_iso(),
+            "timestamp": request.get("timestamp", processed_at),
+            "server_processed_at": processed_at,
         }
     )
     save_state(state)
@@ -122,6 +160,9 @@ def handle_login(request: dict) -> dict:
 
 def handle_list_channels(request: dict) -> dict:
     state = load_state()
+    processed_at = now_iso()
+    persist_request(state, request, processed_at)
+    save_state(state)
     channels = sorted(set(state["channels"]))
     return ok_response(request, channels=channels)
 
@@ -135,16 +176,83 @@ def handle_create_channel(request: dict) -> dict:
         )
 
     state = load_state()
+    processed_at = now_iso()
+    persist_request(state, request, processed_at)
     if channel in state["channels"]:
+        save_state(state)
         return error_response(request, f"Canal '{channel}' já existe.")
 
-    state["channels"].append(channel)
-    state["channels"] = sorted(set(state["channels"]))
+    state["channels"] = sorted(set([*state["channels"], channel]))
     save_state(state)
     return ok_response(request, channel=channel)
 
 
-def handle_request(request: dict) -> dict:
+def validate_publication_request(state: Dict[str, Any], request: dict) -> str:
+    username = str(request.get("username", "")).strip()
+    channel = str(request.get("channel", "")).strip()
+    message_text = str(request.get("message", "")).strip()
+
+    if username not in state["users"]:
+        return f"Usuário '{username}' não está cadastrado no servidor."
+    if channel not in state["channels"]:
+        return f"Canal '{channel}' não existe."
+    if not message_text:
+        return "A mensagem não pode ser vazia."
+    return ""
+
+
+def build_publication(request: dict, published_at: str) -> dict:
+    return {
+        "type": "CHANNEL_MESSAGE",
+        "publication_id": request.get("request_id"),
+        "channel": request.get("channel"),
+        "message": request.get("message"),
+        "username": request.get("username"),
+        "origin": request.get("origin"),
+        "timestamp": published_at,
+        "client_timestamp": request.get("timestamp"),
+        "server_id": SERVER_ID,
+    }
+
+
+def handle_publish_message(request: dict, pub_socket: zmq.Socket) -> dict:
+    state = load_state()
+    processed_at = now_iso()
+    persist_request(state, request, processed_at)
+
+    validation_error = validate_publication_request(state, request)
+    if validation_error:
+        save_state(state)
+        return error_response(request, validation_error)
+
+    publication = build_publication(request, processed_at)
+    persist_publication(state, publication)
+    save_state(state)
+
+    pub_socket.send_multipart([str(publication["channel"]).encode(), encode_message(publication)])
+    log_message("PUB", publication)
+    return ok_response(
+        request,
+        channel=publication["channel"],
+        message=publication["message"],
+        publication=publication,
+    )
+
+
+def handle_sync_publication(request: dict) -> dict:
+    publication = request.get("publication")
+    if not isinstance(publication, dict):
+        return error_response(request, "Publicação inválida para sincronização.")
+
+    state = load_state()
+    processed_at = now_iso()
+    persist_request(state, request, processed_at)
+    persist_publication(state, publication)
+    save_state(state)
+    return ok_response(request, publication_id=publication.get("publication_id"))
+
+
+def handle_request(request: dict, pub_socket: zmq.Socket) -> dict:
     request_type = request.get("type")
     if request_type == "LOGIN":
         return handle_login(request)
@@ -152,14 +260,22 @@ def handle_request(request: dict) -> dict:
         return handle_list_channels(request)
     if request_type == "CREATE_CHANNEL":
         return handle_create_channel(request)
+    if request_type == "PUBLISH_MESSAGE":
+        return handle_publish_message(request, pub_socket)
+    if request_type == "SYNC_PUBLICATION":
+        return handle_sync_publication(request)
     return error_response(request, f"Tipo de requisição inválido: {request_type}")
 
 
 def main() -> None:
     context = zmq.Context()
-    socket = context.socket(zmq.DEALER)
-    socket.setsockopt(zmq.IDENTITY, SERVER_ID.encode())
-    socket.connect(BACKEND_ENDPOINT)
+
+    rpc_socket = context.socket(zmq.DEALER)
+    rpc_socket.setsockopt(zmq.IDENTITY, SERVER_ID.encode())
+    rpc_socket.connect(BACKEND_ENDPOINT)
+
+    pub_socket = context.socket(zmq.PUB)
+    pub_socket.connect(PUBSUB_PROXY_IN_ENDPOINT)
 
     register_message = {
         "type": "REGISTER_SERVER",
@@ -167,16 +283,16 @@ def main() -> None:
         "timestamp": now_iso(),
     }
     log_message("SEND", register_message)
-    socket.send(encode_message(register_message))
+    rpc_socket.send(encode_message(register_message))
 
     while True:
-        payload = socket.recv()
+        payload = rpc_socket.recv()
         request = decode_message(payload)
         log_message("RECV", request)
 
-        response = handle_request(request)
+        response = handle_request(request, pub_socket)
         log_message("SEND", response)
-        socket.send(encode_message(response))
+        rpc_socket.send(encode_message(response))
 
 
 if __name__ == "__main__":

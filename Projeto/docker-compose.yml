@@ -11,14 +11,26 @@ services:
       - "5555:5555"
       - "5556:5556"
 
+  pubsub_proxy:
+    build: ./pubsub_proxy
+    container_name: pubsub_proxy
+    environment:
+      XSUB_BIND: tcp://*:5557
+      XPUB_BIND: tcp://*:5558
+    ports:
+      - "5557:5557"
+      - "5558:5558"
+
   py_server_1:
     build: ./python/server
     container_name: py_server_1
     depends_on:
       - broker
+      - pubsub_proxy
     environment:
       SERVER_ID: py_server_1
       BACKEND_ENDPOINT: tcp://broker:5556
+      PUBSUB_PROXY_IN_ENDPOINT: tcp://pubsub_proxy:5557
       DATA_FILE: /data/state.json
     volumes:
       - ./data/py_server_1:/data
@@ -28,9 +40,11 @@ services:
     container_name: py_server_2
     depends_on:
       - broker
+      - pubsub_proxy
     environment:
       SERVER_ID: py_server_2
       BACKEND_ENDPOINT: tcp://broker:5556
+      PUBSUB_PROXY_IN_ENDPOINT: tcp://pubsub_proxy:5557
       DATA_FILE: /data/state.json
     volumes:
       - ./data/py_server_2:/data
@@ -40,9 +54,11 @@ services:
     container_name: js_server_1
     depends_on:
       - broker
+      - pubsub_proxy
     environment:
       SERVER_ID: js_server_1
       BACKEND_ENDPOINT: tcp://broker:5556
+      PUBSUB_PROXY_IN_ENDPOINT: tcp://pubsub_proxy:5557
       DATA_FILE: /data/state.json
     volumes:
       - ./data/js_server_1:/data
@@ -52,9 +68,11 @@ services:
     container_name: js_server_2
     depends_on:
       - broker
+      - pubsub_proxy
     environment:
       SERVER_ID: js_server_2
       BACKEND_ENDPOINT: tcp://broker:5556
+      PUBSUB_PROXY_IN_ENDPOINT: tcp://pubsub_proxy:5557
       DATA_FILE: /data/state.json
     volumes:
       - ./data/js_server_2:/data
@@ -64,6 +82,7 @@ services:
     container_name: py_client_1
     depends_on:
       - broker
+      - pubsub_proxy
       - py_server_1
       - py_server_2
       - js_server_1
@@ -73,6 +92,7 @@ services:
       USERNAME: alice_py
       TARGET_CHANNEL: backend
       BROKER_ENDPOINT: tcp://broker:5555
+      PUBSUB_PROXY_OUT_ENDPOINT: tcp://pubsub_proxy:5558
       STARTUP_DELAY_SECONDS: "8"
 
   py_client_2:
@@ -80,6 +100,7 @@ services:
     container_name: py_client_2
     depends_on:
       - broker
+      - pubsub_proxy
       - py_server_1
       - py_server_2
       - js_server_1
@@ -89,6 +110,7 @@ services:
       USERNAME: bob_py
       TARGET_CHANNEL: frontend
       BROKER_ENDPOINT: tcp://broker:5555
+      PUBSUB_PROXY_OUT_ENDPOINT: tcp://pubsub_proxy:5558
       STARTUP_DELAY_SECONDS: "10"
 
   js_client_1:
@@ -96,6 +118,7 @@ services:
     container_name: js_client_1
     depends_on:
       - broker
+      - pubsub_proxy
       - py_server_1
       - py_server_2
       - js_server_1
@@ -105,6 +128,7 @@ services:
       USERNAME: carol_js
       TARGET_CHANNEL: devops
       BROKER_ENDPOINT: tcp://broker:5555
+      PUBSUB_PROXY_OUT_ENDPOINT: tcp://pubsub_proxy:5558
       STARTUP_DELAY_SECONDS: "12"
 
   js_client_2:
@@ -112,6 +136,7 @@ services:
     container_name: js_client_2
     depends_on:
       - broker
+      - pubsub_proxy
       - py_server_1
       - py_server_2
       - js_server_1
@@ -119,6 +144,7 @@ services:
     environment:
       CLIENT_NAME: js_client_2
       USERNAME: dave_js
-      TARGET_CHANNEL: geral
+      TARGET_CHANNEL: analytics
       BROKER_ENDPOINT: tcp://broker:5555
+      PUBSUB_PROXY_OUT_ENDPOINT: tcp://pubsub_proxy:5558
       STARTUP_DELAY_SECONDS: "14"

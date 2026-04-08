@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 import msgpack
@@ -11,6 +12,11 @@ FRONTEND_BIND = os.getenv("FRONTEND_BIND", "tcp://*:5555")
 BACKEND_BIND = os.getenv("BACKEND_BIND", "tcp://*:5556")
 EXPECTED_SERVERS = int(os.getenv("EXPECTED_SERVERS", "4"))
 SERVER_RPC_TIMEOUT_MS = int(os.getenv("SERVER_RPC_TIMEOUT_MS", "8000"))
+
+
+READ_REQUEST_TYPES = {"LIST_CHANNELS"}
+REPLICATED_REQUEST_TYPES = {"LOGIN", "CREATE_CHANNEL"}
+PUBLISH_REQUEST_TYPES = {"PUBLISH_MESSAGE"}
 
 
 def now_iso() -> str:
@@ -122,8 +128,8 @@ class Broker:
 
         return None
 
-    def request_all_servers(self, request: dict) -> Dict[str, dict]:
-        expected = list(self.registered_servers)
+    def request_all_servers(self, request: dict, target_servers: Optional[List[str]] = None) -> Dict[str, dict]:
+        expected = list(target_servers if target_servers is not None else self.registered_servers)
         for server_id in expected:
             self.send_to_server(server_id, request)
 
@@ -145,6 +151,118 @@ class Broker:
 
         return responses
 
+    def process_read_request(self, request: dict) -> dict:
+        server_id = self.choose_server()
+        if server_id is None:
+            return client_reply("ERROR", request, error="Nenhum servidor disponível.")
+
+        response = self.request_single_server(request, server_id)
+        if response is None:
+            return client_reply(
+                "ERROR",
+                request,
+                error=f"Timeout ao consultar o servidor {server_id}.",
+            )
+
+        if response.get("status") != "OK":
+            return client_reply(
+                "ERROR",
+                request,
+                error=response.get("error", "Erro desconhecido no servidor."),
+                server_id=server_id,
+            )
+
+        reply_payload = {
+            key: value
+            for key, value in response.items()
+            if key not in {"type", "status", "request_id", "request_type", "timestamp"}
+        }
+        return client_reply("OK", request, **reply_payload)
+
+    def process_replicated_request(self, request: dict) -> dict:
+        responses = self.request_all_servers(request)
+
+        if len(responses) != len(self.registered_servers):
+            missing = sorted(set(self.registered_servers) - set(responses.keys()))
+            return client_reply(
+                "ERROR",
+                request,
+                error=f"Timeout aguardando respostas dos servidores: {', '.join(missing)}",
+            )
+
+        for server_id, response in responses.items():
+            if response.get("status") != "OK":
+                return client_reply(
+                    "ERROR",
+                    request,
+                    error=response.get("error", "Erro desconhecido no servidor."),
+                    failed_server=server_id,
+                )
+
+        return client_reply(
+            "OK",
+            request,
+            replicated_servers=sorted(responses.keys()),
+        )
+
+    def process_publish_request(self, request: dict) -> dict:
+        primary_server = self.choose_server()
+        if primary_server is None:
+            return client_reply("ERROR", request, error="Nenhum servidor disponível para publicação.")
+
+        primary_response = self.request_single_server(request, primary_server)
+        if primary_response is None:
+            return client_reply(
+                "ERROR",
+                request,
+                error=f"Timeout ao publicar usando o servidor {primary_server}.",
+            )
+
+        if primary_response.get("status") != "OK":
+            return client_reply(
+                "ERROR",
+                request,
+                error=primary_response.get("error", "Erro desconhecido no servidor."),
+                server_id=primary_server,
+            )
+
+        replication_targets = [server_id for server_id in self.registered_servers if server_id != primary_server]
+        replicated_servers = [primary_server]
+        failed_replication: List[str] = []
+
+        if replication_targets:
+            sync_request = {
+                "type": "SYNC_PUBLICATION",
+                "request_id": str(uuid.uuid4()),
+                "timestamp": now_iso(),
+                "origin": "broker",
+                "publication": primary_response.get("publication"),
+                "original_request_id": request.get("request_id"),
+            }
+            sync_responses = self.request_all_servers(sync_request, replication_targets)
+
+            for server_id in replication_targets:
+                response = sync_responses.get(server_id)
+                if response is None or response.get("status") != "OK":
+                    failed_replication.append(server_id)
+                else:
+                    replicated_servers.append(server_id)
+
+        response_payload = {
+            "channel": primary_response.get("channel"),
+            "message": primary_response.get("message"),
+            "server_id": primary_server,
+            "publication": primary_response.get("publication"),
+            "replicated_servers": sorted(replicated_servers),
+        }
+        if failed_replication:
+            response_payload["replication_warning"] = (
+                "Falha ao sincronizar a publicação em alguns servidores."
+            )
+            response_payload["failed_replication"] = sorted(failed_replication)
+
+        return client_reply("OK", request, **response_payload)
+
     def process_request(self, request: dict) -> dict:
         if len(self.registered_servers) < EXPECTED_SERVERS:
             return client_reply(
@@ -155,59 +273,14 @@ class Broker:
 
         request_type = request.get("type")
 
-        if request_type == "LIST_CHANNELS":
-            server_id = self.choose_server()
-            if server_id is None:
-                return client_reply("ERROR", request, error="Nenhum servidor disponível.")
+        if request_type in READ_REQUEST_TYPES:
+            return self.process_read_request(request)
 
-            response = self.request_single_server(request, server_id)
-            if response is None:
-                return client_reply(
-                    "ERROR",
-                    request,
-                    error=f"Timeout ao consultar o servidor {server_id}.",
-                )
+        if request_type in REPLICATED_REQUEST_TYPES:
+            return self.process_replicated_request(request)
 
-            if response.get("status") != "OK":
-                return client_reply(
-                    "ERROR",
-                    request,
-                    error=response.get("error", "Erro desconhecido no servidor."),
-                    server_id=server_id,
-                )
-
-            return client_reply(
-                "OK",
-                request,
-                channels=response.get("channels", []),
-                server_id=server_id,
-            )
-
-        if request_type in {"LOGIN", "CREATE_CHANNEL"}:
-            responses = self.request_all_servers(request)
-
-            if len(responses) != len(self.registered_servers):
-                missing = sorted(set(self.registered_servers) - set(responses.keys()))
-                return client_reply(
-                    "ERROR",
-                    request,
-                    error=f"Timeout aguardando respostas dos servidores: {', '.join(missing)}",
-                )
-
-            for server_id, response in responses.items():
-                if response.get("status") != "OK":
-                    return client_reply(
-                        "ERROR",
-                        request,
-                        error=response.get("error", "Erro desconhecido no servidor."),
-                        failed_server=server_id,
-                    )
-
-            return client_reply(
-                "OK",
-                request,
-                replicated_servers=sorted(responses.keys()),
-            )
+        if request_type in PUBLISH_REQUEST_TYPES:
+            return self.process_publish_request(request)
 
         return client_reply("ERROR", request, error=f"Tipo de requisição inválido: {request_type}")
 
