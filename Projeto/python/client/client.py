@@ -5,7 +5,7 @@ import random
 import threading
 import time
 import uuid
-from typing import List, Set
+from typing import List, Optional, Set
 
 import msgpack
 import zmq
@@ -31,6 +31,39 @@ MESSAGE_TEMPLATES = [
     "Evento sincronizado {counter} para o tópico {channel}",
     "Heartbeat do bot {user} no canal {channel}",
 ]
+
+
+class LogicalClock:
+    def __init__(self) -> None:
+        self.value = 0
+        self.lock = threading.Lock()
+
+    def tick(self) -> int:
+        with self.lock:
+            self.value += 1
+            return self.value
+
+    def update_from_message(self, message: Optional[dict]) -> int:
+        if not isinstance(message, dict):
+            with self.lock:
+                return self.value
+
+        received = message.get("logical_clock")
+
+        with self.lock:
+            if isinstance(received, int):
+                self.value = max(self.value, received)
+            elif isinstance(received, str) and received.isdigit():
+                self.value = max(self.value, int(received))
+
+            return self.value
+
+    def current(self) -> int:
+        with self.lock:
+            return self.value
+
+
+LOGICAL_CLOCK = LogicalClock()
 
 
 def now_iso() -> str:
@@ -67,6 +100,7 @@ class SubscriptionReceiver(threading.Thread):
         context = zmq.Context()
         socket = context.socket(zmq.SUB)
         socket.connect(self.endpoint)
+
         poller = zmq.Poller()
         poller.register(socket, zmq.POLLIN)
         self.ready.set()
@@ -87,18 +121,24 @@ class SubscriptionReceiver(threading.Thread):
                     )
 
             events = dict(poller.poll(250))
+
             if socket not in events:
                 continue
 
             topic_bytes, payload = socket.recv_multipart()
             message = decode_message(payload)
+            LOGICAL_CLOCK.update_from_message(message)
+
             received_message = {
                 "channel": topic_bytes.decode(),
                 "message": message.get("message"),
                 "sent_timestamp": message.get("timestamp"),
+                "sent_logical_clock": message.get("logical_clock"),
                 "received_timestamp": now_iso(),
+                "received_logical_clock": LOGICAL_CLOCK.current(),
                 "username": message.get("username"),
                 "server_id": message.get("server_id"),
+                "server_rank": message.get("server_rank"),
                 "publication_id": message.get("publication_id"),
             }
             log_message("PUBSUB_RECV", received_message)
@@ -111,12 +151,15 @@ def send_request(socket: zmq.Socket, message: dict) -> dict:
     poller = zmq.Poller()
     poller.register(socket, zmq.POLLIN)
     events = dict(poller.poll(REQUEST_TIMEOUT_MS))
+
     if socket not in events:
         raise TimeoutError("Timeout aguardando resposta do broker.")
 
     payload = socket.recv()
     response = decode_message(payload)
+    LOGICAL_CLOCK.update_from_message(response)
     log_message("RECV", response)
+
     return response
 
 
@@ -125,6 +168,7 @@ def make_request(request_type: str, **extra) -> dict:
         "type": request_type,
         "request_id": str(uuid.uuid4()),
         "timestamp": now_iso(),
+        "logical_clock": LOGICAL_CLOCK.tick(),
         "origin": CLIENT_NAME,
         **extra,
     }
@@ -132,8 +176,10 @@ def make_request(request_type: str, **extra) -> dict:
 
 def list_channels(socket: zmq.Socket, username: str) -> List[str]:
     response = send_request(socket, make_request("LIST_CHANNELS", username=username))
+
     if response.get("status") != "OK":
         raise RuntimeError(response.get("error", "Falha ao listar canais."))
+
     return list(response.get("channels", []))
 
 
@@ -145,16 +191,19 @@ def ensure_single_channel_creation(socket: zmq.Socket, username: str, channels: 
         socket,
         make_request("CREATE_CHANNEL", username=username, channel=TARGET_CHANNEL),
     )
+
     if create_response.get("status") != "OK":
         print(
             f"[{CLIENT_NAME}] Não foi possível criar canal '{TARGET_CHANNEL}': {create_response.get('error')}",
             flush=True,
         )
+
     return list_channels(socket, username)
 
 
 def maybe_subscribe_more(receiver: SubscriptionReceiver, channels: List[str]) -> None:
     available_candidates = [channel for channel in channels if channel not in receiver.subscribed_channels]
+
     if len(receiver.subscribed_channels) >= MINIMUM_SUBSCRIPTIONS or not available_candidates:
         return
 
@@ -170,9 +219,11 @@ def random_message(channel: str, username: str, counter: int) -> str:
 
 def login(socket: zmq.Socket) -> str:
     active_username = USERNAME
+
     for attempt in range(1, 11):
         candidate = active_username if attempt == 1 else f"{USERNAME}_{attempt}"
         response = send_request(socket, make_request("LOGIN", username=candidate))
+
         if response.get("status") == "OK":
             return candidate
 
@@ -184,7 +235,9 @@ def login(socket: zmq.Socket) -> str:
 
 def publish_batch(socket: zmq.Socket, username: str, channel: str, batch_number: int) -> None:
     for message_counter in range(1, MESSAGES_PER_BATCH + 1):
-        message_text = random_message(channel, username, ((batch_number - 1) * MESSAGES_PER_BATCH) + message_counter)
+        absolute_counter = ((batch_number - 1) * MESSAGES_PER_BATCH) + message_counter
+        message_text = random_message(channel, username, absolute_counter)
+
         response = send_request(
             socket,
             make_request(
@@ -194,11 +247,13 @@ def publish_batch(socket: zmq.Socket, username: str, channel: str, batch_number:
                 message=message_text,
             ),
         )
+
         if response.get("status") != "OK":
             print(
                 f"[{CLIENT_NAME}] Falha ao publicar no canal '{channel}': {response.get('error')}",
                 flush=True,
             )
+
         time.sleep(MESSAGE_INTERVAL_SECONDS)
 
 
@@ -220,6 +275,7 @@ def main() -> None:
     maybe_subscribe_more(receiver, channels)
 
     batch_number = 0
+
     while True:
         channels = list_channels(socket, active_username)
         maybe_subscribe_more(receiver, channels)

@@ -21,16 +21,28 @@ services:
       - "5557:5557"
       - "5558:5558"
 
+  reference_service:
+    build: ./reference_service
+    container_name: reference_service
+    environment:
+      REFERENCE_BIND: tcp://*:5560
+      SERVER_ORDER: js_server_1,js_server_2,py_server_1,py_server_2
+      HEARTBEAT_TIMEOUT_SECONDS: "35"
+    ports:
+      - "5560:5560"
+
   py_server_1:
     build: ./python/server
     container_name: py_server_1
     depends_on:
       - broker
       - pubsub_proxy
+      - reference_service
     environment:
       SERVER_ID: py_server_1
       BACKEND_ENDPOINT: tcp://broker:5556
       PUBSUB_PROXY_IN_ENDPOINT: tcp://pubsub_proxy:5557
+      REFERENCE_ENDPOINT: tcp://reference_service:5560
       DATA_FILE: /data/state.json
     volumes:
       - ./data/py_server_1:/data
@@ -41,10 +53,12 @@ services:
     depends_on:
       - broker
       - pubsub_proxy
+      - reference_service
     environment:
       SERVER_ID: py_server_2
       BACKEND_ENDPOINT: tcp://broker:5556
       PUBSUB_PROXY_IN_ENDPOINT: tcp://pubsub_proxy:5557
+      REFERENCE_ENDPOINT: tcp://reference_service:5560
       DATA_FILE: /data/state.json
     volumes:
       - ./data/py_server_2:/data
@@ -55,10 +69,12 @@ services:
     depends_on:
       - broker
       - pubsub_proxy
+      - reference_service
     environment:
       SERVER_ID: js_server_1
       BACKEND_ENDPOINT: tcp://broker:5556
       PUBSUB_PROXY_IN_ENDPOINT: tcp://pubsub_proxy:5557
+      REFERENCE_ENDPOINT: tcp://reference_service:5560
       DATA_FILE: /data/state.json
     volumes:
       - ./data/js_server_1:/data
@@ -69,10 +85,12 @@ services:
     depends_on:
       - broker
       - pubsub_proxy
+      - reference_service
     environment:
       SERVER_ID: js_server_2
       BACKEND_ENDPOINT: tcp://broker:5556
       PUBSUB_PROXY_IN_ENDPOINT: tcp://pubsub_proxy:5557
+      REFERENCE_ENDPOINT: tcp://reference_service:5560
       DATA_FILE: /data/state.json
     volumes:
       - ./data/js_server_2:/data
