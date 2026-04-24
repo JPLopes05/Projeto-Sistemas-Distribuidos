@@ -23,6 +23,27 @@ const MESSAGE_TEMPLATES = [
   "Heartbeat do bot {user} no canal {channel}"
 ];
 
+let logicalClock = 0;
+
+function tickLogicalClock() {
+  logicalClock += 1;
+  return logicalClock;
+}
+
+function updateLogicalClockFromMessage(message) {
+  if (!message || typeof message !== "object") {
+    return logicalClock;
+  }
+
+  const received = Number(message.logical_clock);
+
+  if (Number.isInteger(received)) {
+    logicalClock = Math.max(logicalClock, received);
+  }
+
+  return logicalClock;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -40,6 +61,7 @@ function makeRequest(type, extra = {}) {
     type,
     request_id: crypto.randomUUID(),
     timestamp: nowIso(),
+    logical_clock: tickLogicalClock(),
     origin: CLIENT_NAME,
     ...extra
   };
@@ -56,6 +78,7 @@ async function sendRequest(socket, message) {
   const receivePromise = (async () => {
     const [payload] = await socket.receive();
     const response = decode(payload);
+    updateLogicalClockFromMessage(response);
     logMessage("RECV", response);
     return response;
   })();
@@ -65,9 +88,11 @@ async function sendRequest(socket, message) {
 
 async function listChannels(socket, username) {
   const response = await sendRequest(socket, makeRequest("LIST_CHANNELS", { username }));
+
   if (response.status !== "OK") {
     throw new Error(response.error || "Falha ao listar canais.");
   }
+
   return Array.isArray(response.channels) ? response.channels : [];
 }
 
@@ -75,6 +100,7 @@ async function login(socket) {
   for (let attempt = 1; attempt <= 10; attempt += 1) {
     const candidate = attempt === 1 ? USERNAME : `${USERNAME}_${attempt}`;
     const response = await sendRequest(socket, makeRequest("LOGIN", { username: candidate }));
+
     if (response.status === "OK") {
       return candidate;
     }
@@ -110,15 +136,21 @@ async function startPubSubListener(subscriber) {
   (async () => {
     for await (const [topicBuffer, payload] of subscriber) {
       const publication = decode(payload);
+      updateLogicalClockFromMessage(publication);
+
       const receivedMessage = {
         channel: topicBuffer.toString(),
         message: publication.message,
         sent_timestamp: publication.timestamp,
+        sent_logical_clock: publication.logical_clock,
         received_timestamp: nowIso(),
+        received_logical_clock: logicalClock,
         username: publication.username,
         server_id: publication.server_id,
+        server_rank: publication.server_rank,
         publication_id: publication.publication_id
       };
+
       logMessage("PUBSUB_RECV", receivedMessage);
     }
   })().catch((error) => {
@@ -128,6 +160,7 @@ async function startPubSubListener(subscriber) {
 
 function maybeSubscribeMore(subscriber, subscribedChannels, channels) {
   const availableCandidates = channels.filter((channel) => !subscribedChannels.has(channel));
+
   if (subscribedChannels.size >= MINIMUM_SUBSCRIPTIONS || availableCandidates.length === 0) {
     return;
   }
@@ -140,6 +173,7 @@ function maybeSubscribeMore(subscriber, subscribedChannels, channels) {
 
 function randomMessage(channel, username, counter) {
   const template = MESSAGE_TEMPLATES[Math.floor(Math.random() * MESSAGE_TEMPLATES.length)];
+
   return template
     .replaceAll("{channel}", channel)
     .replaceAll("{user}", username)
@@ -148,7 +182,9 @@ function randomMessage(channel, username, counter) {
 
 async function publishBatch(socket, username, channel, batchNumber) {
   for (let messageCounter = 1; messageCounter <= MESSAGES_PER_BATCH; messageCounter += 1) {
-    const messageText = randomMessage(channel, username, ((batchNumber - 1) * MESSAGES_PER_BATCH) + messageCounter);
+    const absoluteCounter = ((batchNumber - 1) * MESSAGES_PER_BATCH) + messageCounter;
+    const messageText = randomMessage(channel, username, absoluteCounter);
+
     const response = await sendRequest(
       socket,
       makeRequest("PUBLISH_MESSAGE", {
@@ -177,12 +213,14 @@ async function main() {
   await startPubSubListener(subscriber);
 
   const subscribedChannels = new Set();
+
   const activeUsername = await login(requestSocket);
   let channels = await listChannels(requestSocket, activeUsername);
   channels = await ensureSingleChannelCreation(requestSocket, activeUsername, channels);
   maybeSubscribeMore(subscriber, subscribedChannels, channels);
 
   let batchNumber = 0;
+
   while (true) {
     channels = await listChannels(requestSocket, activeUsername);
     maybeSubscribeMore(subscriber, subscribedChannels, channels);
@@ -193,6 +231,7 @@ async function main() {
     }
 
     batchNumber += 1;
+
     const selectedChannel = channels[Math.floor(Math.random() * channels.length)];
     await publishBatch(requestSocket, activeUsername, selectedChannel, batchNumber);
 
