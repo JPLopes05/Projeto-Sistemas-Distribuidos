@@ -7,21 +7,38 @@ const crypto = require("crypto");
 const SERVER_ID = process.env.SERVER_ID || "js_server_1";
 const BACKEND_ENDPOINT = process.env.BACKEND_ENDPOINT || "tcp://broker:5556";
 const PUBSUB_PROXY_IN_ENDPOINT = process.env.PUBSUB_PROXY_IN_ENDPOINT || "tcp://pubsub_proxy:5557";
+const PUBSUB_PROXY_OUT_ENDPOINT = process.env.PUBSUB_PROXY_OUT_ENDPOINT || "tcp://pubsub_proxy:5558";
 const REFERENCE_ENDPOINT = process.env.REFERENCE_ENDPOINT || "tcp://reference_service:5560";
 const DATA_FILE = process.env.DATA_FILE || "/data/state.json";
 
 const REFERENCE_TIMEOUT_MS = Number(process.env.REFERENCE_TIMEOUT_MS || "5000");
 const HEARTBEAT_EVERY_CLIENT_MESSAGES = Number(process.env.HEARTBEAT_EVERY_CLIENT_MESSAGES || "10");
+const CLOCK_SYNC_EVERY_MESSAGES = Number(process.env.CLOCK_SYNC_EVERY_MESSAGES || "15");
+const SERVER_RPC_TIMEOUT_MS = Number(process.env.SERVER_RPC_TIMEOUT_MS || "2500");
+const SERVER_RPC_PORT = Number(process.env.SERVER_RPC_PORT || "5570");
+
+const SERVER_ORDER = (process.env.SERVER_ORDER || "js_server_1,js_server_2,py_server_1,py_server_2")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
+
+const SERVER_ENDPOINTS = Object.fromEntries(
+  SERVER_ORDER.map((serverId) => [serverId, `tcp://${serverId}:${SERVER_RPC_PORT}`])
+);
 
 const USERNAME_REGEX = /^[A-Za-z0-9_-]{3,20}$/;
 const CHANNEL_REGEX = /^[A-Za-z0-9_-]{3,30}$/;
 
 const CLIENT_REQUEST_TYPES = new Set(["LOGIN", "LIST_CHANNELS", "CREATE_CHANNEL", "PUBLISH_MESSAGE"]);
+const BROKER_REQUEST_TYPES = new Set(["LOGIN", "LIST_CHANNELS", "CREATE_CHANNEL", "PUBLISH_MESSAGE", "SYNC_PUBLICATION"]);
+const SERVERS_TOPIC = "servers";
 
 let logicalClock = 0;
 let physicalClockOffsetMs = 0;
 let serverRank = null;
 let clientMessageCount = 0;
+let exchangedMessageCount = 0;
+let currentCoordinatorId = SERVER_ORDER[0] || SERVER_ID;
 
 function tickLogicalClock() {
   logicalClock += 1;
@@ -50,15 +67,44 @@ function correctedNowIso() {
   return correctedNowDate().toISOString();
 }
 
-function updatePhysicalClockFromReference(response) {
-  const referenceMs = Number(response.reference_timestamp_epoch_ms);
+function correctedEpochMs() {
+  return correctedNowDate().getTime();
+}
 
-  if (!Number.isInteger(referenceMs)) {
+function serverRankFor(serverId) {
+  const index = SERVER_ORDER.indexOf(serverId);
+  return index >= 0 ? index + 1 : 9999;
+}
+
+function getCurrentCoordinator() {
+  return currentCoordinatorId;
+}
+
+function setCurrentCoordinator(coordinatorId, source) {
+  const normalizedCoordinatorId = String(coordinatorId || "").trim();
+  if (!normalizedCoordinatorId) {
     return;
   }
 
-  physicalClockOffsetMs = referenceMs - Date.now();
-  console.log(`[${SERVER_ID}][CLOCK_SYNC] offset_fisico_ms=${physicalClockOffsetMs}`);
+  const previous = currentCoordinatorId;
+  currentCoordinatorId = normalizedCoordinatorId;
+
+  if (previous !== normalizedCoordinatorId) {
+    console.log(
+      `[${SERVER_ID}][COORDINATOR_UPDATE] coordenador=${normalizedCoordinatorId} anterior=${previous} origem=${source}`
+    );
+  }
+}
+
+function updatePhysicalClockFromCoordinator(coordinatorEpochMs, coordinatorId) {
+  const epoch = Number(coordinatorEpochMs);
+
+  if (!Number.isInteger(epoch)) {
+    return;
+  }
+
+  physicalClockOffsetMs = epoch - Date.now();
+  console.log(`[${SERVER_ID}][CLOCK_SYNC_FROM_COORDINATOR] coordenador=${coordinatorId} offset_fisico_ms=${physicalClockOffsetMs}`);
 }
 
 function logMessage(direction, message) {
@@ -73,12 +119,15 @@ function defaultState() {
   return {
     server_id: SERVER_ID,
     server_rank: serverRank,
+    current_coordinator_id: getCurrentCoordinator(),
     users: [],
     logins: [],
     channels: ["geral"],
     requests: [],
     publications: [],
-    heartbeats: []
+    heartbeats: [],
+    clock_syncs: [],
+    elections: []
   };
 }
 
@@ -86,6 +135,7 @@ function saveState(state) {
   ensureParent(DATA_FILE);
   state.server_id = SERVER_ID;
   state.server_rank = serverRank;
+  state.current_coordinator_id = getCurrentCoordinator();
 
   const tempFile = `${DATA_FILE}.tmp`;
   fs.writeFileSync(tempFile, JSON.stringify(state, null, 2), "utf8");
@@ -107,12 +157,15 @@ function loadState() {
 
     state.server_id = state.server_id || SERVER_ID;
     state.server_rank = state.server_rank || serverRank;
+    state.current_coordinator_id = state.current_coordinator_id || getCurrentCoordinator();
     state.users = Array.isArray(state.users) ? state.users : [];
     state.logins = Array.isArray(state.logins) ? state.logins : [];
     state.channels = Array.isArray(state.channels) ? state.channels : ["geral"];
     state.requests = Array.isArray(state.requests) ? state.requests : [];
     state.publications = Array.isArray(state.publications) ? state.publications : [];
     state.heartbeats = Array.isArray(state.heartbeats) ? state.heartbeats : [];
+    state.clock_syncs = Array.isArray(state.clock_syncs) ? state.clock_syncs : [];
+    state.elections = Array.isArray(state.elections) ? state.elections : [];
 
     if (!state.channels.includes("geral")) {
       state.channels.push("geral");
@@ -141,7 +194,8 @@ function persistRequest(state, request, processedAt) {
     client_timestamp: request.timestamp,
     client_logical_clock: request.logical_clock,
     server_processed_at: processedAt,
-    server_logical_clock_after_receive: logicalClock
+    server_logical_clock_after_receive: logicalClock,
+    current_coordinator_id: getCurrentCoordinator()
   });
 }
 
@@ -185,7 +239,6 @@ async function referenceRequest(type, extra = {}) {
   try {
     const response = await Promise.race([receivePromise, timeoutPromise]);
     updateLogicalClockFromMessage(response);
-    updatePhysicalClockFromReference(response);
     logMessage("REFERENCE_RECV", response);
     socket.close();
     return response;
@@ -214,6 +267,66 @@ async function registerRankWithReference() {
   throw new Error("Não foi possível obter rank no serviço de referência.");
 }
 
+async function serverRpcRequest(targetServerId, type, extra = {}) {
+  const endpoint = SERVER_ENDPOINTS[targetServerId];
+
+  if (!endpoint) {
+    throw new Error(`Endpoint não configurado para servidor '${targetServerId}'.`);
+  }
+
+  const socket = new zmq.Request();
+  socket.connect(endpoint);
+
+  const request = {
+    type,
+    request_id: crypto.randomUUID(),
+    server_id: SERVER_ID,
+    server_rank: serverRank,
+    timestamp: correctedNowIso(),
+    logical_clock: tickLogicalClock(),
+    ...extra
+  };
+
+  logMessage(`SERVER_RPC_SEND:${targetServerId}`, request);
+  await socket.send(encode(request));
+
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`Timeout ao consultar servidor ${targetServerId} para ${type}.`)), SERVER_RPC_TIMEOUT_MS);
+  });
+
+  const receivePromise = (async () => {
+    const [payload] = await socket.receive();
+    return decode(payload);
+  })();
+
+  try {
+    const response = await Promise.race([receivePromise, timeoutPromise]);
+    updateLogicalClockFromMessage(response);
+    logMessage(`SERVER_RPC_RECV:${targetServerId}`, response);
+    socket.close();
+    return response;
+  } catch (error) {
+    socket.close();
+    throw error;
+  }
+}
+
+async function publishCoordinatorAnnouncement(pubSocket, coordinatorId, reason) {
+  const announcement = {
+    type: "COORDINATOR_ANNOUNCEMENT",
+    coordinator_id: coordinatorId,
+    coordinator_rank: serverRankFor(coordinatorId),
+    announcer_id: SERVER_ID,
+    announcer_rank: serverRank,
+    reason,
+    timestamp: correctedNowIso(),
+    logical_clock: tickLogicalClock()
+  };
+
+  await pubSocket.send([Buffer.from(SERVERS_TOPIC), encode(announcement)]);
+  logMessage("PUB:servers", announcement);
+}
+
 async function sendHeartbeatIfNeeded() {
   if (clientMessageCount === 0) {
     return;
@@ -225,7 +338,8 @@ async function sendHeartbeatIfNeeded() {
 
   try {
     const response = await referenceRequest("HEARTBEAT", {
-      processed_client_messages: clientMessageCount
+      processed_client_messages: clientMessageCount,
+      current_coordinator_id: getCurrentCoordinator()
     });
 
     const state = loadState();
@@ -234,12 +348,243 @@ async function sendHeartbeatIfNeeded() {
       logical_clock: logicalClock,
       processed_client_messages: clientMessageCount,
       reference_status: response.status,
-      active_servers: response.active_servers || []
+      active_servers: response.active_servers || [],
+      current_coordinator_id: getCurrentCoordinator()
     });
     saveState(state);
   } catch (error) {
     console.log(`[${SERVER_ID}][HEARTBEAT] Falha ao enviar heartbeat: ${error.message}`);
   }
+}
+
+function internalOkResponse(request, extra = {}) {
+  return {
+    type: "SERVER_INTERNAL_REPLY",
+    request_id: request.request_id,
+    request_type: request.type,
+    status: "OK",
+    server_id: SERVER_ID,
+    server_rank: serverRank,
+    current_coordinator_id: getCurrentCoordinator(),
+    timestamp: correctedNowIso(),
+    logical_clock: tickLogicalClock(),
+    ...extra
+  };
+}
+
+function internalErrorResponse(request, error) {
+  return {
+    type: "SERVER_INTERNAL_REPLY",
+    request_id: request.request_id,
+    request_type: request.type,
+    status: "ERROR",
+    server_id: SERVER_ID,
+    server_rank: serverRank,
+    current_coordinator_id: getCurrentCoordinator(),
+    timestamp: correctedNowIso(),
+    logical_clock: tickLogicalClock(),
+    error
+  };
+}
+
+function handleInternalRequest(request) {
+  updateLogicalClockFromMessage(request);
+  exchangedMessageCount += 1;
+
+  switch (request.type) {
+    case "CLOCK_REQUEST":
+      if (getCurrentCoordinator() !== SERVER_ID) {
+        return internalErrorResponse(
+          request,
+          `Servidor '${SERVER_ID}' não é o coordenador atual. Coordenador conhecido: ${getCurrentCoordinator()}`
+        );
+      }
+
+      return internalOkResponse(request, {
+        coordinator_id: SERVER_ID,
+        coordinator_epoch_ms: correctedEpochMs()
+      });
+
+    case "ELECTION_REQUEST":
+      return internalOkResponse(request, {
+        election_response: "OK"
+      });
+
+    case "COORDINATOR_NOTIFICATION": {
+      const coordinatorId = String(request.coordinator_id || "").trim();
+      if (coordinatorId) {
+        setCurrentCoordinator(coordinatorId, `direct_notification_from_${request.server_id}`);
+      }
+      return internalOkResponse(request, { coordinator_id: getCurrentCoordinator() });
+    }
+
+    default:
+      return internalErrorResponse(request, `Tipo de requisição interna inválido: ${request.type}`);
+  }
+}
+
+async function startInternalRpcServer() {
+  const socket = new zmq.Reply();
+  await socket.bind(`tcp://*:${SERVER_RPC_PORT}`);
+
+  console.log(`[${SERVER_ID}][SERVER_RPC] Escutando em tcp://*:${SERVER_RPC_PORT}`);
+
+  for await (const [payload] of socket) {
+    const request = decode(payload);
+    logMessage("SERVER_RPC_RECV", request);
+
+    const response = handleInternalRequest(request);
+    logMessage("SERVER_RPC_SEND", response);
+    await socket.send(encode(response));
+  }
+}
+
+async function startServersSubscription() {
+  const subscriber = new zmq.Subscriber();
+  subscriber.connect(PUBSUB_PROXY_OUT_ENDPOINT);
+  subscriber.subscribe(SERVERS_TOPIC);
+
+  console.log(`[${SERVER_ID}][SUBSCRIBE] Inscrito no tópico '${SERVERS_TOPIC}'`);
+
+  for await (const [topicBuffer, payload] of subscriber) {
+    const message = decode(payload);
+    updateLogicalClockFromMessage(message);
+    logMessage("PUBSUB_RECV:servers", message);
+
+    if (message.type === "COORDINATOR_ANNOUNCEMENT") {
+      const coordinatorId = String(message.coordinator_id || "").trim();
+      if (coordinatorId) {
+        setCurrentCoordinator(coordinatorId, `pubsub_from_${message.announcer_id}`);
+      }
+    }
+  }
+}
+
+function startBackgroundServices() {
+  startInternalRpcServer().catch((error) => {
+    console.error(`[${SERVER_ID}][SERVER_RPC] Erro fatal:`, error);
+    process.exit(1);
+  });
+
+  startServersSubscription().catch((error) => {
+    console.error(`[${SERVER_ID}][SUBSCRIBE] Erro fatal:`, error);
+    process.exit(1);
+  });
+}
+
+async function electCoordinator(pubSocket, reason) {
+  const candidates = [[SERVER_ID, serverRank || serverRankFor(SERVER_ID)]];
+
+  console.log(`[${SERVER_ID}][ELECTION_START] motivo=${reason}`);
+
+  for (const otherServerId of SERVER_ORDER) {
+    if (otherServerId === SERVER_ID) {
+      continue;
+    }
+
+    try {
+      const response = await serverRpcRequest(otherServerId, "ELECTION_REQUEST", {
+        reason,
+        known_coordinator_id: getCurrentCoordinator()
+      });
+
+      if (response.status === "OK") {
+        candidates.push([
+          String(response.server_id || otherServerId),
+          Number(response.server_rank || serverRankFor(otherServerId))
+        ]);
+      }
+    } catch (error) {
+      console.log(`[${SERVER_ID}][ELECTION] servidor=${otherServerId} indisponível motivo=${error.message}`);
+    }
+  }
+
+  const [electedId, electedRank] = candidates.sort((a, b) => a[1] - b[1])[0];
+  setCurrentCoordinator(electedId, "election_result");
+  await publishCoordinatorAnnouncement(pubSocket, electedId, reason);
+
+  const state = loadState();
+  state.elections.push({
+    timestamp: correctedNowIso(),
+    logical_clock: logicalClock,
+    reason,
+    candidates: candidates.map((item) => ({ server_id: item[0], rank: item[1] })),
+    elected_id: electedId,
+    elected_rank: electedRank
+  });
+  saveState(state);
+
+  console.log(`[${SERVER_ID}][ELECTION_RESULT] coordenador=${electedId} rank=${electedRank}`);
+  return electedId;
+}
+
+async function synchronizeClockWithCoordinator(pubSocket, reason) {
+  const coordinatorId = getCurrentCoordinator();
+
+  if (coordinatorId === SERVER_ID) {
+    console.log(`[${SERVER_ID}][BERKELEY_COORDINATOR] servidor_atual_eh_coordenador mensagem=${reason}`);
+    return;
+  }
+
+  try {
+    const response = await serverRpcRequest(coordinatorId, "CLOCK_REQUEST", { reason });
+
+    if (response.status !== "OK") {
+      throw new Error(response.error || "Resposta inválida do coordenador.");
+    }
+
+    const coordinatorEpochMs = Number(response.coordinator_epoch_ms);
+
+    if (!Number.isInteger(coordinatorEpochMs)) {
+      throw new Error("Coordenador não retornou coordinator_epoch_ms inteiro.");
+    }
+
+    updatePhysicalClockFromCoordinator(coordinatorEpochMs, coordinatorId);
+
+    const state = loadState();
+    state.clock_syncs.push({
+      timestamp: correctedNowIso(),
+      logical_clock: logicalClock,
+      reason,
+      coordinator_id: coordinatorId,
+      coordinator_epoch_ms: coordinatorEpochMs,
+      status: "OK"
+    });
+    saveState(state);
+
+    console.log(`[${SERVER_ID}][BERKELEY_SYNC] coordenador=${coordinatorId} status=OK`);
+  } catch (error) {
+    console.log(`[${SERVER_ID}][COORDINATOR_UNAVAILABLE] coordenador=${coordinatorId} motivo=${error.message}`);
+    const electedId = await electCoordinator(pubSocket, `coordenador_indisponivel:${coordinatorId}`);
+
+    if (electedId !== SERVER_ID) {
+      try {
+        const response = await serverRpcRequest(electedId, "CLOCK_REQUEST", {
+          reason: `apos_eleicao:${reason}`
+        });
+
+        const coordinatorEpochMs = Number(response.coordinator_epoch_ms);
+        if (response.status === "OK" && Number.isInteger(coordinatorEpochMs)) {
+          updatePhysicalClockFromCoordinator(coordinatorEpochMs, electedId);
+          console.log(`[${SERVER_ID}][BERKELEY_SYNC] coordenador=${electedId} status=OK`);
+        }
+      } catch (syncError) {
+        console.log(`[${SERVER_ID}][BERKELEY_SYNC] falha_apos_eleicao coordenador=${electedId} motivo=${syncError.message}`);
+      }
+    }
+  }
+}
+
+async function maybeSyncClock(pubSocket) {
+  if (exchangedMessageCount === 0) {
+    return;
+  }
+
+  if (exchangedMessageCount % CLOCK_SYNC_EVERY_MESSAGES !== 0) {
+    return;
+  }
+
+  await synchronizeClockWithCoordinator(pubSocket, `mensagens_trocadas:${exchangedMessageCount}`);
 }
 
 function okResponse(request, extra = {}) {
@@ -251,6 +596,7 @@ function okResponse(request, extra = {}) {
     status: "OK",
     server_id: SERVER_ID,
     server_rank: serverRank,
+    current_coordinator_id: getCurrentCoordinator(),
     request_type: request.type,
     ...extra
   };
@@ -265,6 +611,7 @@ function errorResponse(request, error) {
     status: "ERROR",
     server_id: SERVER_ID,
     server_rank: serverRank,
+    current_coordinator_id: getCurrentCoordinator(),
     request_type: request.type,
     error
   };
@@ -370,7 +717,8 @@ function buildPublication(request, publishedAt) {
     client_timestamp: request.timestamp,
     client_logical_clock: request.logical_clock,
     server_id: SERVER_ID,
-    server_rank: serverRank
+    server_rank: serverRank,
+    current_coordinator_id: getCurrentCoordinator()
   };
 }
 
@@ -420,6 +768,10 @@ function handleSyncPublication(request) {
 async function handleRequest(request, pubSocket) {
   updateLogicalClockFromMessage(request);
 
+  if (BROKER_REQUEST_TYPES.has(request.type)) {
+    exchangedMessageCount += 1;
+  }
+
   if (CLIENT_REQUEST_TYPES.has(request.type)) {
     clientMessageCount += 1;
     await sendHeartbeatIfNeeded();
@@ -443,6 +795,7 @@ async function handleRequest(request, pubSocket) {
 
 async function main() {
   await registerRankWithReference();
+  startBackgroundServices();
 
   const rpcSocket = new zmq.Dealer({ routingId: SERVER_ID });
   rpcSocket.connect(BACKEND_ENDPOINT);
@@ -450,10 +803,18 @@ async function main() {
   const pubSocket = new zmq.Publisher();
   pubSocket.connect(PUBSUB_PROXY_IN_ENDPOINT);
 
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  if (serverRank === 1) {
+    setCurrentCoordinator(SERVER_ID, "initial_rank_1");
+    await publishCoordinatorAnnouncement(pubSocket, SERVER_ID, "initial_rank_1");
+  }
+
   const registerMessage = {
     type: "REGISTER_SERVER",
     server_id: SERVER_ID,
     server_rank: serverRank,
+    current_coordinator_id: getCurrentCoordinator(),
     timestamp: correctedNowIso(),
     logical_clock: tickLogicalClock()
   };
@@ -468,6 +829,8 @@ async function main() {
     const response = await handleRequest(request, pubSocket);
     logMessage("SEND", response);
     await rpcSocket.send(encode(response));
+
+    await maybeSyncClock(pubSocket);
   }
 }
 

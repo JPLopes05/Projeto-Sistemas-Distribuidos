@@ -113,16 +113,19 @@ def active_servers_list() -> list:
     )
 
 
-def base_reply(request: dict, status: str, **extra) -> dict:
+def base_reply(request: dict, status: str, include_reference_time: bool = False, **extra) -> dict:
     response = {
         "type": "REFERENCE_REPLY",
         "request_id": request.get("request_id"),
         "request_type": request.get("type"),
         "status": status,
         "timestamp": now_iso(),
-        "reference_timestamp_epoch_ms": now_epoch_ms(),
         "logical_clock": LOGICAL_CLOCK.tick(),
     }
+
+    if include_reference_time:
+        response["reference_timestamp_epoch_ms"] = now_epoch_ms()
+
     response.update(extra)
     return response
 

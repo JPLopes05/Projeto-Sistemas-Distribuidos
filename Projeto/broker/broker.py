@@ -11,8 +11,12 @@ import zmq
 FRONTEND_BIND = os.getenv("FRONTEND_BIND", "tcp://*:5555")
 BACKEND_BIND = os.getenv("BACKEND_BIND", "tcp://*:5556")
 EXPECTED_SERVERS = int(os.getenv("EXPECTED_SERVERS", "4"))
-SERVER_RPC_TIMEOUT_MS = int(os.getenv("SERVER_RPC_TIMEOUT_MS", "8000"))
 
+# Mantém compatibilidade com o docker-compose atual, mas usa um timeout menor
+# para conseguir detectar servidor morto antes dos clientes desistirem.
+SERVER_RPC_TIMEOUT_MS = int(os.getenv("SERVER_RPC_TIMEOUT_MS", "8000"))
+DEAD_SERVER_TIMEOUT_MS = int(os.getenv("DEAD_SERVER_TIMEOUT_MS", "2500"))
+EFFECTIVE_SERVER_TIMEOUT_MS = min(SERVER_RPC_TIMEOUT_MS, DEAD_SERVER_TIMEOUT_MS)
 
 READ_REQUEST_TYPES = {"LIST_CHANNELS"}
 REPLICATED_REQUEST_TYPES = {"LOGIN", "CREATE_CHANNEL"}
@@ -61,9 +65,14 @@ class Broker:
 
         self.registered_servers: List[str] = []
         self.rr_index = 0
+        self.initial_ready = False
 
         print(f"[BROKER] Frontend em {FRONTEND_BIND}", flush=True)
         print(f"[BROKER] Backend em {BACKEND_BIND}", flush=True)
+        print(
+            f"[BROKER] Timeout efetivo por servidor: {EFFECTIVE_SERVER_TIMEOUT_MS}ms",
+            flush=True,
+        )
 
     def ensure_registered(self, server_id: str) -> None:
         if server_id not in self.registered_servers:
@@ -74,10 +83,34 @@ class Broker:
                 flush=True,
             )
 
+        if len(self.registered_servers) >= EXPECTED_SERVERS:
+            self.initial_ready = True
+
+    def remove_server(self, server_id: str, reason: str) -> None:
+        if server_id not in self.registered_servers:
+            return
+
+        self.registered_servers = [
+            registered_server
+            for registered_server in self.registered_servers
+            if registered_server != server_id
+        ]
+
+        if self.registered_servers:
+            self.rr_index = self.rr_index % len(self.registered_servers)
+        else:
+            self.rr_index = 0
+
+        print(
+            f"[BROKER] Servidor removido da lista ativa: {server_id} | motivo={reason} | ativos={self.registered_servers}",
+            flush=True,
+        )
+
     def recv_backend_any(self, timeout_ms: int) -> Optional[Tuple[str, dict]]:
         poller = zmq.Poller()
         poller.register(self.backend, zmq.POLLIN)
         events = dict(poller.poll(timeout_ms))
+
         if self.backend not in events:
             return None
 
@@ -105,89 +138,139 @@ class Broker:
     def choose_server(self) -> Optional[str]:
         if not self.registered_servers:
             return None
+
         server_id = self.registered_servers[self.rr_index % len(self.registered_servers)]
         self.rr_index += 1
         return server_id
 
     def request_single_server(self, request: dict, server_id: str) -> Optional[dict]:
+        if server_id not in self.registered_servers:
+            return None
+
         self.send_to_server(server_id, request)
-        deadline = time.time() + (SERVER_RPC_TIMEOUT_MS / 1000)
+        deadline = time.time() + (EFFECTIVE_SERVER_TIMEOUT_MS / 1000)
 
         while time.time() < deadline:
             remaining_ms = max(1, int((deadline - time.time()) * 1000))
             result = self.recv_backend_any(remaining_ms)
+
             if result is None:
                 break
 
             recv_server_id, message = result
+
             if message.get("type") == "REGISTER_SERVER":
                 continue
 
             if recv_server_id == server_id and message.get("request_id") == request.get("request_id"):
                 return message
 
+            print(
+                f"[BROKER] Resposta fora de contexto recebida de {recv_server_id}. Ignorando.",
+                flush=True,
+            )
+
+        self.remove_server(
+            server_id,
+            f"sem resposta para {request.get('type')} request_id={request.get('request_id')}",
+        )
         return None
 
     def request_all_servers(self, request: dict, target_servers: Optional[List[str]] = None) -> Dict[str, dict]:
         expected = list(target_servers if target_servers is not None else self.registered_servers)
+        expected = [server_id for server_id in expected if server_id in self.registered_servers]
+
         for server_id in expected:
             self.send_to_server(server_id, request)
 
         responses: Dict[str, dict] = {}
-        deadline = time.time() + (SERVER_RPC_TIMEOUT_MS / 1000)
+        deadline = time.time() + (EFFECTIVE_SERVER_TIMEOUT_MS / 1000)
 
         while len(responses) < len(expected) and time.time() < deadline:
             remaining_ms = max(1, int((deadline - time.time()) * 1000))
             result = self.recv_backend_any(remaining_ms)
+
             if result is None:
                 break
 
             server_id, message = result
+
             if message.get("type") == "REGISTER_SERVER":
                 continue
 
             if server_id in expected and message.get("request_id") == request.get("request_id"):
                 responses[server_id] = message
+            else:
+                print(
+                    f"[BROKER] Resposta fora de contexto recebida de {server_id}. Ignorando.",
+                    flush=True,
+                )
+
+        missing = sorted(set(expected) - set(responses.keys()))
+        for server_id in missing:
+            self.remove_server(
+                server_id,
+                f"sem resposta para replicação {request.get('type')} request_id={request.get('request_id')}",
+            )
 
         return responses
 
     def process_read_request(self, request: dict) -> dict:
-        server_id = self.choose_server()
-        if server_id is None:
-            return client_reply("ERROR", request, error="Nenhum servidor disponível.")
+        attempted_servers = set()
 
-        response = self.request_single_server(request, server_id)
-        if response is None:
-            return client_reply(
-                "ERROR",
-                request,
-                error=f"Timeout ao consultar o servidor {server_id}.",
-            )
+        while len(attempted_servers) < len(self.registered_servers):
+            server_id = self.choose_server()
 
-        if response.get("status") != "OK":
-            return client_reply(
-                "ERROR",
-                request,
-                error=response.get("error", "Erro desconhecido no servidor."),
-                server_id=server_id,
-            )
+            if server_id is None:
+                break
 
-        reply_payload = {
-            key: value
-            for key, value in response.items()
-            if key not in {"type", "status", "request_id", "request_type", "timestamp"}
-        }
-        return client_reply("OK", request, **reply_payload)
+            if server_id in attempted_servers:
+                continue
+
+            attempted_servers.add(server_id)
+            response = self.request_single_server(request, server_id)
+
+            if response is None:
+                continue
+
+            if response.get("status") != "OK":
+                return client_reply(
+                    "ERROR",
+                    request,
+                    error=response.get("error", "Erro desconhecido no servidor."),
+                    server_id=server_id,
+                )
+
+            reply_payload = {
+                key: value
+                for key, value in response.items()
+                if key not in {"type", "status", "request_id", "request_type", "timestamp"}
+            }
+            return client_reply("OK", request, **reply_payload)
+
+        return client_reply(
+            "ERROR",
+            request,
+            error="Nenhum servidor ativo respondeu à leitura.",
+        )
 
     def process_replicated_request(self, request: dict) -> dict:
-        responses = self.request_all_servers(request)
+        target_servers = list(self.registered_servers)
 
-        if len(responses) != len(self.registered_servers):
-            missing = sorted(set(self.registered_servers) - set(responses.keys()))
+        if not target_servers:
             return client_reply(
                 "ERROR",
                 request,
-                error=f"Timeout aguardando respostas dos servidores: {', '.join(missing)}",
+                error="Nenhum servidor disponível para replicação.",
+            )
+
+        responses = self.request_all_servers(request, target_servers)
+
+        if not responses:
+            return client_reply(
+                "ERROR",
+                request,
+                error="Nenhum servidor ativo respondeu à replicação.",
             )
 
         for server_id, response in responses.items():
@@ -199,34 +282,65 @@ class Broker:
                     failed_server=server_id,
                 )
 
-        return client_reply(
-            "OK",
-            request,
-            replicated_servers=sorted(responses.keys()),
-        )
+        missing = sorted(set(target_servers) - set(responses.keys()))
+
+        reply_payload = {
+            "replicated_servers": sorted(responses.keys()),
+        }
+
+        if missing:
+            reply_payload["replication_warning"] = (
+                "Alguns servidores não responderam e foram removidos da lista ativa."
+            )
+            reply_payload["removed_servers"] = missing
+
+        return client_reply("OK", request, **reply_payload)
 
     def process_publish_request(self, request: dict) -> dict:
-        primary_server = self.choose_server()
-        if primary_server is None:
-            return client_reply("ERROR", request, error="Nenhum servidor disponível para publicação.")
+        attempted_servers = set()
+        primary_server = None
+        primary_response = None
 
-        primary_response = self.request_single_server(request, primary_server)
-        if primary_response is None:
+        while len(attempted_servers) < len(self.registered_servers):
+            candidate_server = self.choose_server()
+
+            if candidate_server is None:
+                break
+
+            if candidate_server in attempted_servers:
+                continue
+
+            attempted_servers.add(candidate_server)
+            response = self.request_single_server(request, candidate_server)
+
+            if response is None:
+                continue
+
+            if response.get("status") != "OK":
+                return client_reply(
+                    "ERROR",
+                    request,
+                    error=response.get("error", "Erro desconhecido no servidor."),
+                    server_id=candidate_server,
+                )
+
+            primary_server = candidate_server
+            primary_response = response
+            break
+
+        if primary_server is None or primary_response is None:
             return client_reply(
                 "ERROR",
                 request,
-                error=f"Timeout ao publicar usando o servidor {primary_server}.",
+                error="Nenhum servidor ativo respondeu à publicação.",
             )
 
-        if primary_response.get("status") != "OK":
-            return client_reply(
-                "ERROR",
-                request,
-                error=primary_response.get("error", "Erro desconhecido no servidor."),
-                server_id=primary_server,
-            )
+        replication_targets = [
+            server_id
+            for server_id in self.registered_servers
+            if server_id != primary_server
+        ]
 
-        replication_targets = [server_id for server_id in self.registered_servers if server_id != primary_server]
         replicated_servers = [primary_server]
         failed_replication: List[str] = []
 
@@ -239,10 +353,12 @@ class Broker:
                 "publication": primary_response.get("publication"),
                 "original_request_id": request.get("request_id"),
             }
+
             sync_responses = self.request_all_servers(sync_request, replication_targets)
 
             for server_id in replication_targets:
                 response = sync_responses.get(server_id)
+
                 if response is None or response.get("status") != "OK":
                     failed_replication.append(server_id)
                 else:
@@ -255,20 +371,32 @@ class Broker:
             "publication": primary_response.get("publication"),
             "replicated_servers": sorted(replicated_servers),
         }
+
         if failed_replication:
             response_payload["replication_warning"] = (
-                "Falha ao sincronizar a publicação em alguns servidores."
+                "Falha ao sincronizar a publicação em alguns servidores. "
+                "Os servidores sem resposta foram removidos da lista ativa."
             )
             response_payload["failed_replication"] = sorted(failed_replication)
 
         return client_reply("OK", request, **response_payload)
 
     def process_request(self, request: dict) -> dict:
-        if len(self.registered_servers) < EXPECTED_SERVERS:
+        if not self.initial_ready and len(self.registered_servers) < EXPECTED_SERVERS:
             return client_reply(
                 "ERROR",
                 request,
-                error=f"Broker ainda não está pronto. Servidores registrados: {len(self.registered_servers)}/{EXPECTED_SERVERS}",
+                error=(
+                    f"Broker ainda não está pronto. "
+                    f"Servidores registrados: {len(self.registered_servers)}/{EXPECTED_SERVERS}"
+                ),
+            )
+
+        if not self.registered_servers:
+            return client_reply(
+                "ERROR",
+                request,
+                error="Nenhum servidor ativo disponível.",
             )
 
         request_type = request.get("type")
@@ -282,7 +410,11 @@ class Broker:
         if request_type in PUBLISH_REQUEST_TYPES:
             return self.process_publish_request(request)
 
-        return client_reply("ERROR", request, error=f"Tipo de requisição inválido: {request_type}")
+        return client_reply(
+            "ERROR",
+            request,
+            error=f"Tipo de requisição inválido: {request_type}",
+        )
 
     def reply_to_client(self, client_frames: List[bytes], message: dict) -> None:
         client_id = client_frames[0].decode(errors="ignore")
@@ -299,8 +431,10 @@ class Broker:
 
             if self.backend in events:
                 result = self.recv_backend_any(0)
+
                 if result is not None:
                     server_id, message = result
+
                     if message.get("type") != "REGISTER_SERVER":
                         print(
                             f"[BROKER] Resposta fora de contexto recebida de {server_id}. Ignorando.",
