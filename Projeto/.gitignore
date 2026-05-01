@@ -1,0 +1,15 @@
+# Execução / logs
+*.log
+validacao*.txt
+execucao*.txt
+
+# Dados gerados em runtime
+Projeto/data/
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
