@@ -6,7 +6,8 @@ services:
       FRONTEND_BIND: tcp://*:5555
       BACKEND_BIND: tcp://*:5556
       EXPECTED_SERVERS: "4"
-      SERVER_RPC_TIMEOUT_MS: "8000"
+      SERVER_RPC_TIMEOUT_MS: "20000"
+      DEAD_SERVER_TIMEOUT_MS: "20000"
     ports:
       - "5555:5555"
       - "5556:5556"
