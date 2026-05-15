@@ -422,69 +422,105 @@ O comportamento esperado é:
 - Arquivos de `data/`, logs e `__pycache__` são gerados durante execução e não precisam ser versionados
 ---
 
+---
+
 # Parte 5 - Consistência e Replicação
 
-A quinta parte do projeto trata da consistência e da replicação dos dados armazenados nos servidores.
+A quinta parte do projeto trata da consistência e da replicação dos dados armazenados pelos servidores.
 
-Como o broker faz balanceamento de carga entre os servidores usando round-robin, cada mensagem poderia ser processada inicialmente por um servidor diferente. Se cada servidor armazenasse apenas as mensagens que recebeu diretamente, o histórico ficaria dividido entre os servidores. Nesse caso, se um servidor parasse de funcionar, parte do histórico seria perdida, e uma consulta feita a um servidor específico poderia retornar apenas uma parte das mensagens.
+Como o broker faz balanceamento de carga usando round-robin, cada publicação poderia ser processada inicialmente por um servidor diferente. Se cada servidor armazenasse apenas as mensagens que recebeu diretamente, o histórico ficaria dividido entre os servidores. Nesse caso, se um servidor parasse de funcionar, parte do histórico poderia ser perdida, e uma consulta feita a um servidor específico poderia retornar apenas uma parte das mensagens.
 
 Para resolver esse problema, foi adotada uma estratégia de **replicação primário-cópias com atualização eager**, coordenada pelo broker.
 
 ## Método escolhido
 
-O método escolhido foi a replicação em que um servidor atua como primário para uma publicação específica, e os demais servidores recebem cópias dessa publicação logo em seguida.
+O método escolhido foi a **replicação primário-cópias com atualização eager**.
 
-O fluxo funciona assim:
+Nesse modelo, uma publicação é recebida primeiro por um servidor primário. Em seguida, essa mesma publicação é enviada para os demais servidores, que passam a manter uma cópia local dos dados.
+
+No projeto, o fluxo funciona assim:
 
 ```text
 Cliente -> Broker -> Servidor primário
 Servidor primário salva a publicação
 Broker -> Demais servidores com SYNC_PUBLICATION
 Demais servidores salvam a mesma publicação
+```
 
-Com isso, mesmo que o broker continue usando round-robin para balancear as requisições, todas as mensagens publicadas são copiadas para todos os servidores ativos.
+Com isso, mesmo que o broker continue distribuindo as requisições entre os servidores, todos os servidores ativos passam a possuir as mesmas publicações.
 
-Como foi implementado
+## Como foi implementado
 
-Quando um cliente envia uma mensagem do tipo PUBLISH_MESSAGE, o broker escolhe um servidor primário usando round-robin. Esse servidor valida a mensagem, cria uma publicação com um identificador único chamado publication_id e salva essa publicação no seu state.json.
+Quando um cliente envia uma mensagem do tipo `PUBLISH_MESSAGE`, o broker escolhe um servidor primário usando round-robin.
 
-Depois disso, o broker recebe a publicação criada e envia uma mensagem SYNC_PUBLICATION para os demais servidores ativos. Cada servidor que recebe essa mensagem salva a mesma publicação em seu próprio state.json.
+Esse servidor primário:
+
+- valida a mensagem;
+- cria uma publicação;
+- gera um identificador único chamado `publication_id`;
+- salva a publicação no seu `state.json`;
+- retorna a publicação para o broker.
+
+Depois disso, o broker envia uma mensagem `SYNC_PUBLICATION` para os demais servidores ativos.
+
+Cada servidor que recebe `SYNC_PUBLICATION` salva a mesma publicação no seu próprio `state.json`.
 
 Assim, todos os servidores passam a possuir a mesma lista de publicações.
 
-Controle de duplicidade
+## Controle de duplicidade
 
-Para evitar mensagens duplicadas, cada publicação possui um campo:
+Para evitar mensagens duplicadas, cada publicação possui o campo:
 
+```text
 publication_id
+```
 
-Antes de salvar uma publicação, o servidor verifica se já existe uma publicação com o mesmo publication_id. Se já existir, a publicação é ignorada. Se não existir, ela é salva.
+Antes de salvar uma publicação, o servidor verifica se já existe uma publicação com o mesmo `publication_id`.
 
-Isso torna a replicação idempotente, ou seja, mesmo que uma mensagem de sincronização seja recebida mais de uma vez, ela não será duplicada no histórico.
+Se já existir, a publicação é ignorada.  
+Se não existir, ela é salva.
 
-Sincronização de estado entre servidores
+Com isso, a replicação se torna idempotente, ou seja, mesmo que uma sincronização seja recebida mais de uma vez, ela não gera duplicidade no histórico.
 
-Além da replicação feita no momento da publicação, os servidores também possuem uma sincronização de estado entre si.
+## Sincronização de estado entre servidores
 
-Quando um servidor inicia, ele pode pedir um snapshot do estado de outros servidores usando:
+Além da replicação feita no momento da publicação, também foi adicionada uma sincronização de estado entre servidores.
 
+Quando um servidor inicia, ele pode solicitar o estado de outros servidores usando:
+
+```text
 STATE_SNAPSHOT_REQUEST
+```
 
-O servidor que recebe essa requisição responde com usuários, canais, logins e publicações armazenadas. O servidor solicitante mescla esses dados ao seu estado local, sem duplicar publicações.
+O servidor que recebe essa requisição responde com um snapshot contendo:
 
-Essa sincronização reforça a consistência do sistema, principalmente em situações em que um servidor sobe depois dos outros ou precisa recuperar dados que ainda não estavam no seu arquivo local.
+- usuários;
+- canais;
+- logins;
+- publicações.
 
-Validação da replicação
+O servidor solicitante mescla esses dados ao seu estado local, sem duplicar publicações.
 
-A validação foi feita comparando os arquivos state.json dos quatro servidores:
+Essa adaptação foi adicionada para reforçar a consistência do sistema caso um servidor suba depois dos outros ou precise recuperar dados que ainda não estavam no seu arquivo local.
 
+## Validação da replicação
+
+A validação foi feita comparando os arquivos `state.json` dos quatro servidores:
+
+```text
 data/js_server_1/state.json
 data/js_server_2/state.json
 data/py_server_1/state.json
 data/py_server_2/state.json
+```
 
-O resultado esperado é que todos possuam a mesma quantidade de publicações e os mesmos publication_id.
+O resultado esperado é que todos possuam a mesma quantidade de publicações e os mesmos `publication_id`.
 
+No teste realizado, os quatro servidores ficaram com 202 publicações cada um, e a comparação retornou:
+
+```text
+RESULTADO FINAL: OK - todos os servidores possuem as mesmas publicações.
+```
 Em teste realizado, os quatro servidores ficaram com a mesma quantidade de publicações e a comparação retornou:
 
 RESULTADO FINAL: OK - todos os servidores possuem as mesmas publicações.
