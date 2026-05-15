@@ -521,7 +521,4 @@ No teste realizado, os quatro servidores ficaram com 202 publicações cada um, 
 ```text
 RESULTADO FINAL: OK - todos os servidores possuem as mesmas publicações.
 ```
-Em teste realizado, os quatro servidores ficaram com a mesma quantidade de publicações e a comparação retornou:
-
-RESULTADO FINAL: OK - todos os servidores possuem as mesmas publicações.
 
