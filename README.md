@@ -1,4 +1,4 @@
-# Sistema Distribuído de Mensagens - Partes 1, 2, 3 e 4
+# Sistema Distribuído de Mensagens - Partes 1, 2, 3, 4 e 5
 
 Projeto da disciplina de Sistemas Distribuídos.
 
