@@ -16,6 +16,8 @@ const HEARTBEAT_EVERY_CLIENT_MESSAGES = Number(process.env.HEARTBEAT_EVERY_CLIEN
 const CLOCK_SYNC_EVERY_MESSAGES = Number(process.env.CLOCK_SYNC_EVERY_MESSAGES || "15");
 const SERVER_RPC_TIMEOUT_MS = Number(process.env.SERVER_RPC_TIMEOUT_MS || "2500");
 const SERVER_RPC_PORT = Number(process.env.SERVER_RPC_PORT || "5570");
+const STATE_SYNC_INITIAL_DELAY_SECONDS = Number(process.env.STATE_SYNC_INITIAL_DELAY_SECONDS || "1.5");
+const STATE_SYNC_MAX_ATTEMPTS = Number(process.env.STATE_SYNC_MAX_ATTEMPTS || "3");
 
 const SERVER_ORDER = (process.env.SERVER_ORDER || "js_server_1,js_server_2,py_server_1,py_server_2")
   .split(",")
@@ -127,7 +129,8 @@ function defaultState() {
     publications: [],
     heartbeats: [],
     clock_syncs: [],
-    elections: []
+    elections: [],
+    state_syncs: []
   };
 }
 
@@ -166,6 +169,7 @@ function loadState() {
     state.heartbeats = Array.isArray(state.heartbeats) ? state.heartbeats : [];
     state.clock_syncs = Array.isArray(state.clock_syncs) ? state.clock_syncs : [];
     state.elections = Array.isArray(state.elections) ? state.elections : [];
+    state.state_syncs = Array.isArray(state.state_syncs) ? state.state_syncs : [];
 
     if (!state.channels.includes("geral")) {
       state.channels.push("geral");
@@ -209,6 +213,167 @@ function persistPublication(state, publication) {
   }
 
   state.publications.push(publication);
+}
+
+function buildStateSnapshot(state) {
+  return {
+    source_server_id: SERVER_ID,
+    source_server_rank: serverRank,
+    generated_at: correctedNowIso(),
+    users: Array.from(state.users || []),
+    channels: Array.from(state.channels || []),
+    logins: Array.from(state.logins || []),
+    publications: Array.from(state.publications || [])
+  };
+}
+
+function mergeUniqueItemsByKey(localItems, remoteItems, keyName) {
+  const merged = Array.isArray(localItems) ? [...localItems] : [];
+  const existingKeys = new Set(
+    merged
+      .filter((item) => item && typeof item === "object" && item[keyName])
+      .map((item) => item[keyName])
+  );
+
+  let addedCount = 0;
+
+  for (const item of Array.isArray(remoteItems) ? remoteItems : []) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const itemKey = item[keyName];
+    if (!itemKey || existingKeys.has(itemKey)) {
+      continue;
+    }
+
+    merged.push(item);
+    existingKeys.add(itemKey);
+    addedCount += 1;
+  }
+
+  return { merged, addedCount };
+}
+
+function mergeLogins(localLogins, remoteLogins) {
+  const merged = Array.isArray(localLogins) ? [...localLogins] : [];
+  const existingKeys = new Set(
+    merged
+      .filter((item) => item && typeof item === "object")
+      .map((item) => `${item.username || ""}|${item.timestamp || ""}|${item.server_processed_at || ""}`)
+  );
+
+  let addedCount = 0;
+
+  for (const item of Array.isArray(remoteLogins) ? remoteLogins : []) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const itemKey = `${item.username || ""}|${item.timestamp || ""}|${item.server_processed_at || ""}`;
+    if (existingKeys.has(itemKey)) {
+      continue;
+    }
+
+    merged.push(item);
+    existingKeys.add(itemKey);
+    addedCount += 1;
+  }
+
+  return { merged, addedCount };
+}
+
+function mergeStateSnapshot(localState, snapshot) {
+  const remoteUsers = Array.isArray(snapshot.users) ? snapshot.users : [];
+  const remoteChannels = Array.isArray(snapshot.channels) ? snapshot.channels : [];
+  const remoteLogins = Array.isArray(snapshot.logins) ? snapshot.logins : [];
+  const remotePublications = Array.isArray(snapshot.publications) ? snapshot.publications : [];
+
+  const usersBefore = Array.isArray(localState.users) ? localState.users.length : 0;
+  const channelsBefore = Array.isArray(localState.channels) ? localState.channels.length : 0;
+
+  localState.users = Array.from(new Set([...(localState.users || []), ...remoteUsers])).sort();
+  localState.channels = Array.from(new Set([...(localState.channels || []), ...remoteChannels, "geral"])).sort();
+
+  const loginMerge = mergeLogins(localState.logins || [], remoteLogins);
+  localState.logins = loginMerge.merged;
+
+  const publicationMerge = mergeUniqueItemsByKey(
+    localState.publications || [],
+    remotePublications,
+    "publication_id"
+  );
+  localState.publications = publicationMerge.merged;
+
+  return {
+    added_users: localState.users.length - usersBefore,
+    added_channels: localState.channels.length - channelsBefore,
+    added_logins: loginMerge.addedCount,
+    added_publications: publicationMerge.addedCount
+  };
+}
+
+async function synchronizeReplicatedStateFromPeers() {
+  // Parte 5: quando um servidor sobe ou retorna após falha, ele consulta os outros
+  // servidores ativos e mescla usuários, canais e publicações. Isso reforça a
+  // replicação feita pelo broker via SYNC_PUBLICATION.
+  await new Promise((resolve) => setTimeout(resolve, STATE_SYNC_INITIAL_DELAY_SECONDS * 1000));
+
+  for (let attempt = 1; attempt <= STATE_SYNC_MAX_ATTEMPTS; attempt += 1) {
+    let totalAddedPublications = 0;
+    const syncedFrom = [];
+
+    for (const otherServerId of SERVER_ORDER) {
+      if (otherServerId === SERVER_ID) {
+        continue;
+      }
+
+      try {
+        const response = await serverRpcRequest(otherServerId, "STATE_SNAPSHOT_REQUEST", {
+          reason: `state_sync_attempt:${attempt}`
+        });
+
+        if (response.status !== "OK" || !response.snapshot || typeof response.snapshot !== "object") {
+          continue;
+        }
+
+        const state = loadState();
+        const mergeResult = mergeStateSnapshot(state, response.snapshot);
+
+        state.state_syncs.push({
+          timestamp: correctedNowIso(),
+          logical_clock: logicalClock,
+          attempt,
+          source_server_id: response.snapshot.source_server_id || otherServerId,
+          merge_result: mergeResult
+        });
+
+        saveState(state);
+
+        totalAddedPublications += mergeResult.added_publications;
+        syncedFrom.push(otherServerId);
+
+        console.log(
+          `[${SERVER_ID}][STATE_SYNC] origem=${otherServerId} publicacoes_adicionadas=${mergeResult.added_publications}`
+        );
+      } catch (error) {
+        console.log(
+          `[${SERVER_ID}][STATE_SYNC] tentativa=${attempt} servidor=${otherServerId} indisponível motivo=${error.message}`
+        );
+      }
+    }
+
+    if (syncedFrom.length > 0) {
+      console.log(
+        `[${SERVER_ID}][STATE_SYNC_DONE] tentativa=${attempt} sincronizado_de=${JSON.stringify(syncedFrom)} novas_publicacoes=${totalAddedPublications}`
+      );
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  console.log(`[${SERVER_ID}][STATE_SYNC_DONE] nenhum snapshot disponível no momento`);
 }
 
 async function referenceRequest(type, extra = {}) {
@@ -416,6 +581,11 @@ function handleInternalRequest(request) {
         setCurrentCoordinator(coordinatorId, `direct_notification_from_${request.server_id}`);
       }
       return internalOkResponse(request, { coordinator_id: getCurrentCoordinator() });
+    }
+
+    case "STATE_SNAPSHOT_REQUEST": {
+      const state = loadState();
+      return internalOkResponse(request, { snapshot: buildStateSnapshot(state) });
     }
 
     default:
@@ -796,6 +966,7 @@ async function handleRequest(request, pubSocket) {
 async function main() {
   await registerRankWithReference();
   startBackgroundServices();
+  await synchronizeReplicatedStateFromPeers();
 
   const rpcSocket = new zmq.Dealer({ routingId: SERVER_ID });
   rpcSocket.connect(BACKEND_ENDPOINT);
