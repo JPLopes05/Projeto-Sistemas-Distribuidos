@@ -27,6 +27,8 @@ HEARTBEAT_EVERY_CLIENT_MESSAGES = int(os.getenv("HEARTBEAT_EVERY_CLIENT_MESSAGES
 CLOCK_SYNC_EVERY_MESSAGES = int(os.getenv("CLOCK_SYNC_EVERY_MESSAGES", "15"))
 SERVER_RPC_TIMEOUT_MS = int(os.getenv("SERVER_RPC_TIMEOUT_MS", "2500"))
 SERVER_RPC_PORT = int(os.getenv("SERVER_RPC_PORT", "5570"))
+STATE_SYNC_INITIAL_DELAY_SECONDS = float(os.getenv("STATE_SYNC_INITIAL_DELAY_SECONDS", "1.5"))
+STATE_SYNC_MAX_ATTEMPTS = int(os.getenv("STATE_SYNC_MAX_ATTEMPTS", "3"))
 
 SERVER_ORDER = [
     item.strip()
@@ -184,6 +186,7 @@ def default_state() -> Dict[str, Any]:
         "heartbeats": [],
         "clock_syncs": [],
         "elections": [],
+        "state_syncs": [],
     }
 
 
@@ -233,6 +236,7 @@ def load_state() -> Dict[str, Any]:
     state.setdefault("heartbeats", [])
     state.setdefault("clock_syncs", [])
     state.setdefault("elections", [])
+    state.setdefault("state_syncs", [])
 
     if "geral" not in state["channels"]:
         state["channels"].append("geral")
@@ -268,6 +272,166 @@ def persist_publication(state: Dict[str, Any], publication: dict) -> None:
         return
 
     state["publications"].append(publication)
+
+
+def build_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "source_server_id": SERVER_ID,
+        "source_server_rank": SERVER_RANK,
+        "generated_at": corrected_now_iso(),
+        "users": list(state.get("users", [])),
+        "channels": list(state.get("channels", [])),
+        "logins": list(state.get("logins", [])),
+        "publications": list(state.get("publications", [])),
+    }
+
+
+def merge_unique_items_by_key(
+    local_items: List[dict],
+    remote_items: List[dict],
+    key_name: str,
+) -> Tuple[List[dict], int]:
+    merged = list(local_items)
+    existing_keys = {item.get(key_name) for item in merged if isinstance(item, dict) and item.get(key_name)}
+    added_count = 0
+
+    for item in remote_items:
+        if not isinstance(item, dict):
+            continue
+
+        item_key = item.get(key_name)
+        if not item_key or item_key in existing_keys:
+            continue
+
+        merged.append(item)
+        existing_keys.add(item_key)
+        added_count += 1
+
+    return merged, added_count
+
+
+def merge_logins(local_logins: List[dict], remote_logins: List[dict]) -> Tuple[List[dict], int]:
+    merged = list(local_logins)
+    existing_keys = {
+        (item.get("username"), item.get("timestamp"), item.get("server_processed_at"))
+        for item in merged
+        if isinstance(item, dict)
+    }
+    added_count = 0
+
+    for item in remote_logins:
+        if not isinstance(item, dict):
+            continue
+
+        item_key = (item.get("username"), item.get("timestamp"), item.get("server_processed_at"))
+        if item_key in existing_keys:
+            continue
+
+        merged.append(item)
+        existing_keys.add(item_key)
+        added_count += 1
+
+    return merged, added_count
+
+
+def merge_state_snapshot(local_state: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, int]:
+    remote_users = snapshot.get("users", [])
+    remote_channels = snapshot.get("channels", [])
+    remote_logins = snapshot.get("logins", [])
+    remote_publications = snapshot.get("publications", [])
+
+    users_before = len(local_state.get("users", []))
+    channels_before = len(local_state.get("channels", []))
+
+    local_state["users"] = sorted(set(local_state.get("users", [])) | set(remote_users))
+    local_state["channels"] = sorted(set(local_state.get("channels", [])) | set(remote_channels) | {"geral"})
+
+    local_state["logins"], added_logins = merge_logins(
+        local_state.get("logins", []),
+        remote_logins,
+    )
+    local_state["publications"], added_publications = merge_unique_items_by_key(
+        local_state.get("publications", []),
+        remote_publications,
+        "publication_id",
+    )
+
+    return {
+        "added_users": len(local_state["users"]) - users_before,
+        "added_channels": len(local_state["channels"]) - channels_before,
+        "added_logins": added_logins,
+        "added_publications": added_publications,
+    }
+
+
+def synchronize_replicated_state_from_peers(context: zmq.Context) -> None:
+    # Parte 5: quando um servidor sobe ou retorna após falha, ele consulta os outros
+    # servidores ativos e mescla usuários, canais e publicações. Isso reforça a
+    # replicação feita pelo broker via SYNC_PUBLICATION.
+    time.sleep(STATE_SYNC_INITIAL_DELAY_SECONDS)
+
+    for attempt in range(1, STATE_SYNC_MAX_ATTEMPTS + 1):
+        total_added_publications = 0
+        synced_from: List[str] = []
+
+        for other_server_id in SERVER_ORDER:
+            if other_server_id == SERVER_ID:
+                continue
+
+            try:
+                response = server_rpc_request(
+                    context,
+                    other_server_id,
+                    "STATE_SNAPSHOT_REQUEST",
+                    reason=f"state_sync_attempt:{attempt}",
+                )
+
+                if response.get("status") != "OK":
+                    continue
+
+                snapshot = response.get("snapshot")
+                if not isinstance(snapshot, dict):
+                    continue
+
+                state = load_state()
+                merge_result = merge_state_snapshot(state, snapshot)
+                state["state_syncs"].append(
+                    {
+                        "timestamp": corrected_now_iso(),
+                        "logical_clock": LOGICAL_CLOCK.current(),
+                        "attempt": attempt,
+                        "source_server_id": snapshot.get("source_server_id", other_server_id),
+                        "merge_result": merge_result,
+                    }
+                )
+                save_state(state)
+
+                total_added_publications += merge_result["added_publications"]
+                synced_from.append(other_server_id)
+
+                print(
+                    f"[{SERVER_ID}][STATE_SYNC] origem={other_server_id} "
+                    f"publicacoes_adicionadas={merge_result['added_publications']}",
+                    flush=True,
+                )
+
+            except Exception as exc:
+                print(
+                    f"[{SERVER_ID}][STATE_SYNC] tentativa={attempt} servidor={other_server_id} indisponível motivo={exc}",
+                    flush=True,
+                )
+
+        if synced_from:
+            print(
+                f"[{SERVER_ID}][STATE_SYNC_DONE] tentativa={attempt} "
+                f"sincronizado_de={synced_from} novas_publicacoes={total_added_publications}",
+                flush=True,
+            )
+            return
+
+        time.sleep(1)
+
+    print(f"[{SERVER_ID}][STATE_SYNC_DONE] nenhum snapshot disponível no momento", flush=True)
 
 
 def reference_request(context: zmq.Context, request_type: str, **extra) -> dict:
@@ -473,6 +637,10 @@ def handle_internal_request(request: dict) -> dict:
         if coordinator_id:
             set_current_coordinator(coordinator_id, f"direct_notification_from_{request.get('server_id')}")
         return internal_ok_response(request, coordinator_id=get_current_coordinator())
+
+    if request_type == "STATE_SNAPSHOT_REQUEST":
+        state = load_state()
+        return internal_ok_response(request, snapshot=build_state_snapshot(state))
 
     return internal_error_response(request, f"Tipo de requisição interna inválido: {request_type}")
 
@@ -854,6 +1022,7 @@ def main() -> None:
 
     register_rank_with_reference(context)
     start_background_threads(context)
+    synchronize_replicated_state_from_peers(context)
 
     rpc_socket = context.socket(zmq.DEALER)
     rpc_socket.setsockopt(zmq.IDENTITY, SERVER_ID.encode())
